@@ -1,0 +1,23 @@
+services:
+  dsh:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    #   platforms:
+    #     - linux/arm64
+    image: ghcr.io/ly-shadow/dsh-avf:latest
+    container_name: dsh-web
+    restart: unless-stopped
+    ports:
+      - "3080:3080"
+    environment:
+      - DSH_HOST=0.0.0.0
+      - DSH_PORT=3080
+    volumes:
+      - ./dsh-config/cordis.patch.yml:/root/.dsh/cordis.patch.yml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

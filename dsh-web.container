@@ -1,0 +1,13 @@
+[Unit]
+Description=DSH Web Service
+After=network-online.target
+
+[Container]
+Image=ghcr.io/ly-shadow/dsh-avf:latest
+ContainerName=dsh-web
+PublishPort=3080:3080
+Volume=%h/dsh-config/cordis.patch.yml:/root/.dsh/cordis.patch.yml:Z
+AutoUpdate=registry
+
+[Install]
+WantedBy=default.target

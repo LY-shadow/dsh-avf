@@ -1,0 +1,166 @@
+name: Build, Test & Push DSH Image
+
+on:
+  schedule:
+    - cron: '0 18 * * *'            # UTC 18:00 → 北京 02:00 (nightly)
+  workflow_dispatch:
+    inputs:
+      nightly:
+        description: 'nightly 模式（测试通过后推送到仓库）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  IS_NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: default
+            dockerfile: Dockerfile
+            suffix: ""
+          - source: aliyun
+            dockerfile: Dockerfile.aliyun
+            suffix: "-aliyun"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # ── 仅 nightly 登录 GHCR ─────────────────────────────
+      - name: Login to ghcr.io
+        if: env.IS_NIGHTLY == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      # ── 1. Build → load 到本地 daemon（每个 variant 独立 tag）
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/arm64
+          load: true
+          tags: dsh:test-${{ matrix.source }}
+          cache-from: type=gha,scope=${{ matrix.source }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.source }}
+
+      # ── 2. 导出 + 上传 Artifact（合并单步）──────────────
+      - name: Export & upload artifact
+        id: artifact
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          OUT="dsh-avf${{ matrix.suffix }}.tar.gz"
+          echo "📦 Exporting dsh:test-${{ matrix.source }} → $OUT"
+          docker save "dsh:test-${{ matrix.source }}" | gzip > "$OUT"
+          ls -lh "$OUT"
+          echo "artifact_path=$OUT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.artifact.outputs.artifact_path != ''
+        with:
+          name: dsh-avf${{ matrix.suffix }}-${{ github.sha }}
+          path: ${{ steps.artifact.outputs.artifact_path }}
+          retention-days: ${{ env.IS_NIGHTLY == 'true' && 7 || 3 }}
+          compression-level: 0
+
+      # ── 3. Smoke test（原生 ARM64，无需 QEMU）───────────
+      - name: Smoke test
+        id: smoke-test
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          CONTAINER="dsh-smoke-${{ matrix.source }}"
+          IMAGE="dsh:test-${{ matrix.source }}"
+
+          docker run -d --name "$CONTAINER" \
+            --platform linux/arm64 \
+            "$IMAGE"
+
+          echo "⏳ Waiting for DSH to initialize (native ARM64, max 90s)..."
+          READY=false
+          for i in $(seq 1 18); do
+            sleep 5
+
+            RUNNING=$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)
+            if [ "$RUNNING" != "true" ]; then
+              EXIT_CODE=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER" 2>/dev/null || echo "?")
+              echo "❌ FAIL: Container exited early (exit code: $EXIT_CODE)"
+              echo "=========================================="
+              docker logs "$CONTAINER" 2>&1
+              echo "=========================================="
+              docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+              exit 1
+            fi
+
+            # 就绪标志：容器持续运行且无致命错误即视为通过
+            READY=true
+            echo "✅ Container running after $((i * 5))s"
+            break
+          done
+
+          if [ "$READY" != "true" ]; then
+            echo "❌ Container not ready within 90s, dumping logs:"
+            echo "=========================================="
+            docker logs "$CONTAINER" 2>&1
+            echo "=========================================="
+            docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          # ── 输出完整日志 + 致命错误扫描 ──
+          echo "=========================================="
+          echo "📋 Container logs [${{ matrix.source }}]:"
+          echo "=========================================="
+          docker logs "$CONTAINER" 2>&1
+          echo "=========================================="
+
+          if docker logs "$CONTAINER" 2>&1 | grep -qiE \
+            "Error:|FATAL|panic|Cannot find module|ENOENT.*pty\.node|EADDRINUSE|Segmentation fault|UnhandledPromiseRejection|heap out of memory"; then
+            echo "❌ FAIL: Fatal error detected in logs"
+            docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+            exit 1
+          fi
+
+          echo "✅ Smoke test PASSED [${{ matrix.source }}]: container running, no fatal errors"
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+
+      # ── 4. Push（仅 nightly + 测试通过，tag 区分 variant）
+      - name: Push to ghcr.io
+        if: env.IS_NIGHTLY == 'true'
+        run: |
+          set -euo pipefail
+          IMAGE=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          TAG="${IMAGE}:latest${{ matrix.suffix }}"
+          docker tag "dsh:test-${{ matrix.source }}" "$TAG"
+          docker push "$TAG"
+          echo "🚀 Pushed $TAG"
+
+  # ── 5. 清理 GHCR 无标签版本（仅构建成功后执行）─────────
+  cleanup:
+    needs: build-test-push
+    if: always() && (github.event_name == 'schedule' || inputs.nightly) && needs.build-test-push.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete untagged versions (keep latest 3)
+        uses: actions/delete-package-versions@v5
+        with:
+          owner: ${{ github.repository_owner }}
+          package-name: ${{ github.event.repository.name }}
+          package-type: container
+          min-versions-to-keep: 3
+          delete-only-untagged-versions: true
+          token: ${{ secrets.GHCR_PAT }}
